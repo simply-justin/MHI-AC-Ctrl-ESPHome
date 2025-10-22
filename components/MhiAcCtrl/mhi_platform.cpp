@@ -1,5 +1,4 @@
 #include "mhi_platform.h"
-#include "mhi_debug.h"
 
 int SCK_PIN = 14;
 int MOSI_PIN = 13;

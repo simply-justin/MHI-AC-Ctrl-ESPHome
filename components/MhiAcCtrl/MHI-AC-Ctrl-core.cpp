@@ -2,6 +2,21 @@
 // implements the core functions (read & write SPI)
 
 #include "MHI-AC-Ctrl-core.h"
+#include "esphome/core/log.h"
+#include <cstring>
+
+static const char *const MHI_RAW_TAG = "mhi.raw";
+#define MHI_DEBUG_RAW true  // zet op false als je klaar bent
+
+inline void mhi_log_raw(const uint8_t *buf, size_t len) {
+  if (!MHI_DEBUG_RAW) return;
+  char hex[300];
+  hex[0] = 0;
+  for (size_t i = 0; i < len && i < sizeof(hex) - 4; i++) {
+    sprintf(hex + strlen(hex), "%02X ", buf[i]);
+  }
+  ESP_LOGI(MHI_RAW_TAG, "RAW[%u]: %s", (unsigned)len, hex);
+}
 
 uint16_t calc_checksum(byte* frame) {
   uint16_t checksum = 0;
@@ -274,6 +289,8 @@ static byte MOSI_frame[33];
   }
 
   if (new_datapacket_received) {
+
+    mhi_log_raw(MOSI_frame, frameSize);
 
     if (frameSize == 33) { // Only for framesize 33 (WF-RAC)
       byte vanesLRtmp = (MOSI_frame[DB16] & 0x07) + ((MOSI_frame[DB17] & 0x01) << 4);
