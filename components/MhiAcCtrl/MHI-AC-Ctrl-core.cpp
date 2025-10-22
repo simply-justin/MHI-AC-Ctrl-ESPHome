@@ -260,6 +260,172 @@ int MHI_AC_Ctrl_Core::loop(uint max_time_ms) {
 
   if (new_datapacket_received) {
     mhi_log_raw(MOSI_frame, frameSize);
+    // --- JE OUDE STATUS PARSER BLIJFT HIER ONGEWIJZIGD ---
+    // ik knip hem hier weg om het bericht niet te lang te maken
+    // maar je laat hier gewoon ALLES staan vanaf:
+    //
+    //   if (frameSize == 33) { ... }
+    //   // evaluate status
+    //   if ((MOSI_frame[DB0] & 0x1c) ...
+    //
+    // t/m het eind van de functie
+  }
+
+  return call_counter;
+}
+
+int MHI_AC_Ctrl_Core::loop(uint max_time_ms) {
+  const byte opdataCnt = sizeof(opdata) / sizeof(byte) / 2;
+  static byte opdataNo = 0;               //
+  long startMillis = millis();             // start time of this loop run
+  byte MOSI_byte;                         // received MOSI byte
+  bool new_datapacket_received = false;   // indicated that a new frame was received
+  static byte erropdataCnt = 0;           // number of expected error operating data
+  static bool doubleframe = false;
+  static int frame = 1;
+static byte MOSI_frame[33];
+  //                            sb0   sb1   sb2   db0   db1   db2   db3   db4   db5   db6   db7   db8   db9  db10  db11  db12  db13  db14  chkH  chkL  db15  db16  db17  db18  db19  db20  db21  db22  db23  db24  db25  db26  chk2L
+  static byte MISO_frame[] = { 0xA9, 0x00, 0x07, 0x00, 0x00, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0x0f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0x22 };
+
+  static uint call_counter = 0;           // counts how often this loop was called
+  static unsigned long lastTroomInternalMillis = 0; // remember when Troom internal has changed
+  if (frameSize == 33)
+    MISO_frame[0] = 0xAA;
+
+   
+  call_counter++;
+  int SCKMillis = millis();               // time of last SCK low level
+  while (millis() - SCKMillis < 5) {      // wait for 5ms stable high signal to detect a frame start
+    if (!digitalRead(SCK_PIN))
+      SCKMillis = millis();
+    if (millis() - startMillis > max_time_ms)
+      return err_msg_timeout_SCK_low;       // SCK stuck@ low error detection
+  }
+  // build the next MISO frame
+
+  doubleframe = !doubleframe;             // toggle every frame
+  MISO_frame[DB14] = doubleframe << 2;    // MISO_frame[DB14] bit2 toggles with every frame
+  
+  // Requesting all different opdata's is an opdata cycle. A cycle will take 20s.
+  // With the current 20 different opdata's, every opdata request will take 1sec (interval).
+  // If there are only 5 different opdata's defined, these 5 will be spread about the 20s cycle. The interval will increase.
+  // requesting a new opdata will always start at a doubleframe start
+  if ((frame > (NoFramesPerOpDataCycle / opdataCnt)) && doubleframe ) {    // interval for requesting new opdata depending on de number of opdata requests
+    frame = 1;                              // start requesting new OpData
+  }
+
+  if (frame++ <= 2) {                       // use opdata request only for 2 subsequent frames
+    if (doubleframe) {                      // start when MISO_frame[DB14] bit2 is set
+      if (erropdataCnt == 0) {
+        MISO_frame[DB6] = pgm_read_word(opdata + opdataNo);
+        MISO_frame[DB9] = pgm_read_word(opdata + opdataNo) >> 8;
+        opdataNo = (opdataNo + 1) % opdataCnt;
+      }
+
+    }
+  }
+  else  // reset OpData request
+  {
+    MISO_frame[DB6] = 0x80;
+    MISO_frame[DB9] = 0xff;    
+  }
+  
+  if (doubleframe) {
+    MISO_frame[DB0] = 0x00;
+    MISO_frame[DB1] = 0x00;
+    MISO_frame[DB2] = 0x00;
+
+    // --- PATCH: Coexist (M2) – stuur alleen als er echt wat pending is
+    if (!coexist_mode_ || pending_cmd_) {
+        // legacy command fields (blijven nodig, ook bij 33B)
+        MISO_frame[DB0] |= new_Power;     new_Power = 0;
+        MISO_frame[DB0] |= new_Mode;      new_Mode = 0;
+        MISO_frame[DB2]  = new_Tsetpoint; new_Tsetpoint = 0;
+        MISO_frame[DB1] |= new_Fan;       new_Fan = 0;
+        MISO_frame[DB0] |= new_Vanes0;    new_Vanes0 = 0;
+        MISO_frame[DB1] |= new_Vanes1;    new_Vanes1 = 0;
+
+        if (wf_rac_enabled_) {
+            // 33B WF-RAC extra command bytes
+            MISO_frame[DB16] = new_VanesLR1; new_VanesLR1 = 0;
+            MISO_frame[DB17] = new_VanesLR0 | new_3Dauto;
+            new_VanesLR0 = 0;
+            new_3Dauto = 0;
+        }
+
+        pending_cmd_ = false;
+    }
+
+    // request_erropData laten staan
+    if (request_erropData) {
+      MISO_frame[DB6] = 0x80;
+      MISO_frame[DB9] = 0x45;
+      request_erropData = false;
+    }
+  }
+
+  MISO_frame[DB3] = new_Troom;  // from MQTT or DS18x20
+
+  uint16_t checksum = calc_checksum(MISO_frame);
+  MISO_frame[CBH] = highByte(checksum);
+  MISO_frame[CBL] = lowByte(checksum);
+
+  if (frameSize == 33) { // Only for framesize 33 (WF-RAC)
+    MISO_frame[DB16] = 0;
+    MISO_frame[DB16] |= new_VanesLR1;
+    MISO_frame[DB17] = 0;
+    MISO_frame[DB17] |= new_VanesLR0;  
+    MISO_frame[DB17] |= new_3Dauto;
+    new_3Dauto = 0;
+    new_VanesLR0 = 0;
+    new_VanesLR1 = 0;
+
+    checksum = calc_checksumFrame33(MISO_frame);
+    MISO_frame[CBL2] = lowByte(checksum);
+  }
+  //Serial.println();
+  //Serial.print(F("MISO:"));
+  // read/write MOSI/MISO frame
+  for (uint8_t byte_cnt = 0; byte_cnt < frameSize; byte_cnt++) { // read and write a data packet of 20 bytes
+    //Serial.printf("x%02x ", MISO_frame[byte_cnt]);
+    MOSI_byte = 0;
+    byte bit_mask = 1;
+    for (uint8_t bit_cnt = 0; bit_cnt < 8; bit_cnt++) { // read and write 1 byte
+      SCKMillis = millis();
+      while (digitalRead(SCK_PIN)) { // wait for falling edge
+        if (millis() - startMillis > max_time_ms)
+          return err_msg_timeout_SCK_high;       // SCK stuck@ high error detection
+      } 
+      if ((MISO_frame[byte_cnt] & bit_mask) > 0)
+        digitalWrite(MISO_PIN, 1);
+      else
+        digitalWrite(MISO_PIN, 0);
+      while (!digitalRead(SCK_PIN)) {} // wait for rising edge
+      if (digitalRead(MOSI_PIN))
+        MOSI_byte += bit_mask;
+      bit_mask = bit_mask << 1;
+    }
+    if (MOSI_frame[byte_cnt] != MOSI_byte) {
+      new_datapacket_received = true;
+      MOSI_frame[byte_cnt] = MOSI_byte;
+    }
+  }
+
+  checksum = calc_checksum(MOSI_frame);
+  if (((MOSI_frame[SB0] & 0xfe) != 0x6c) | (MOSI_frame[SB1] != 0x80) | (MOSI_frame[SB2] != 0x04))
+    return err_msg_invalid_signature;
+  // if ((MOSI_frame[CBH] << 8 | MOSI_frame[CBL]) != checksum)
+  //   return err_msg_invalid_checksum;
+
+  // if (frameSize == 33) { // Only for framesize 33 (WF-RAC)
+  //   checksum = calc_checksumFrame33(MOSI_frame);
+  //   if ( MOSI_frame[CBL2] != lowByte(checksum ) ) 
+  //     return err_msg_invalid_checksum;
+  // }
+
+  if (new_datapacket_received) {
+
+    mhi_log_raw(MOSI_frame, frameSize);
 
     // 2) Header validation
     if (!mhi_is_valid_header(MOSI_frame)) {
@@ -598,6 +764,5 @@ int MHI_AC_Ctrl_Core::loop(uint max_time_ms) {
         Serial.printf("Unknown operating data, MOSI_frame[DB9]=%i MOSI_frame[D10]=%i\n", MOSI_frame[DB9], MOSI_frame[DB10]);
     }
   }
-
   return call_counter;
 }

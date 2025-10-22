@@ -166,9 +166,9 @@ class MHI_AC_Ctrl_Core {
 
     CallbackInterface_Status *m_cbiStatus;
 
-    bool wf_rac_enabled_ = false;   // true => gebruik 33B command frames (WF-RAC) voor schrijven
-    bool coexist_mode_   = true;    // true => M2: alleen wijzigingen pushen, IR/RC mag ook sturen
-    bool pending_cmd_    = false;   // er staat iets te versturen in volgende frame
+    bool pending_cmd_ = false;     // markeert of er iets naar de AC moet
+    bool wf_rac_enabled_ = false;  // true als frame_size == 33
+    bool coexist_mode_ = true;     // M2-modus: alleen zenden bij pending_cmd_
 
 
   public:
