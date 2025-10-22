@@ -1,4 +1,5 @@
 #include "mhi_platform.h"
+#include "mhi_debug.h"
 
 int SCK_PIN = 14;
 int MOSI_PIN = 13;
@@ -60,7 +61,10 @@ void MhiPlatform::loop() {
 
     int ret = mhi_ac_ctrl_core_.loop(100);
     if (ret < 0) {
-        ESP_LOGE(TAG, "mhi_ac_ctrl_core,loop error: %i", ret);
+        // LOG RAW FRAME
+        mhi_debug_raw(mhi_ac_ctrl_core_.buf_, mhi_ac_ctrl_core_.frame_size_);
+
+        ESP_LOGE(TAG, "mhi_ac_ctrl_core.loop error: %i", ret);
     }
 }
 
