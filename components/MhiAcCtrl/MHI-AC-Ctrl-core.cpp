@@ -77,22 +77,27 @@ void MHI_AC_Ctrl_Core::init() {
 
 void MHI_AC_Ctrl_Core::set_power(boolean power) {
   new_Power = 0b10 | power;
+  pending_cmd_ = true;   // <-- PATCH
 }
 
 void MHI_AC_Ctrl_Core::set_mode(ACMode mode) {
   new_Mode = 0b00100000 | mode;
+  pending_cmd_ = true;   // <-- PATCH
 }
 
 void MHI_AC_Ctrl_Core::set_tsetpoint(uint tsetpoint) {
   new_Tsetpoint = 0b10000000 | tsetpoint;
+  pending_cmd_ = true;   // <-- PATCH
 }
 
 void MHI_AC_Ctrl_Core::set_fan(uint fan) {
   new_Fan = 0b00001000 | fan;
+  pending_cmd_ = true;   // <-- PATCH
 }
 
 void MHI_AC_Ctrl_Core::set_3Dauto(AC3Dauto Dauto) {
   new_3Dauto = 0b00001010 | Dauto;
+  pending_cmd_ = true;   // <-- PATCH
 }
 
 void MHI_AC_Ctrl_Core::set_vanes(uint vanes) {
@@ -103,6 +108,8 @@ void MHI_AC_Ctrl_Core::set_vanes(uint vanes) {
     new_Vanes0 = 0b10000000; // disable swing
     new_Vanes1 = 0b10000000 | ((vanes - 1) << 4);
   }
+
+  pending_cmd_ = true;   // <-- PATCH
 }
 
 void MHI_AC_Ctrl_Core::set_vanesLR(uint vanesLR) {
@@ -113,6 +120,8 @@ void MHI_AC_Ctrl_Core::set_vanesLR(uint vanesLR) {
     new_VanesLR0 = 0b00001010; // disable swing
     new_VanesLR1 = 0b00010000 | (vanesLR - 1);
   }
+
+  pending_cmd_ = true;   // <-- PATCH
 }
 
 void MHI_AC_Ctrl_Core::request_ErrOpData() {
@@ -133,8 +142,11 @@ void MHI_AC_Ctrl_Core::set_troom_offset(float offset) {
 }
 
 void MHI_AC_Ctrl_Core::set_frame_size(byte framesize) {
-  if (framesize == 20 || framesize == 33)
+  if (framesize == 20 || framesize == 33) {
     frameSize = framesize;
+    // --- PATCH: 33B commands aan wanneer 33 is gekozen
+    wf_rac_enabled_ = (framesize == 33);
+  }
 }
 
 inline bool mhi_is_valid_header(const uint8_t *buf) {
@@ -198,40 +210,38 @@ static byte MOSI_frame[33];
     MISO_frame[DB9] = 0xff;    
   }
   
-  if (doubleframe) {                        // and the other MISO data changes are updated when MISO_frame[DB14] bit2 is set
-    MISO_frame[DB0] = 0x00;
-    MISO_frame[DB1] = 0x00;
-    MISO_frame[DB2] = 0x00;
+  if (doubleframe) {
+      MISO_frame[DB0] = 0x00;
+      MISO_frame[DB1] = 0x00;
+      MISO_frame[DB2] = 0x00;
 
-    if (erropdataCnt > 0) {                 // error operating data available
-      MISO_frame[DB6] = 0x80;
-      MISO_frame[DB9] = 0xff;
-      erropdataCnt--;
-    }
+      // --- PATCH: Coexist (M2) – stuur alleen als er echt wat pending is
+      if (!coexist_mode_ || pending_cmd_) {
+          // legacy command fields (blijven nodig, ook bij 33B)
+          MISO_frame[DB0] |= new_Power;     new_Power = 0;
+          MISO_frame[DB0] |= new_Mode;      new_Mode = 0;
+          MISO_frame[DB2]  = new_Tsetpoint; new_Tsetpoint = 0;
+          MISO_frame[DB1] |= new_Fan;       new_Fan = 0;
+          MISO_frame[DB0] |= new_Vanes0;    new_Vanes0 = 0;
+          MISO_frame[DB1] |= new_Vanes1;    new_Vanes1 = 0;
 
-    // set Power, Mode, Tsetpoint, Fan, Vanes
-    MISO_frame[DB0] = new_Power;
-    new_Power = 0;
+          if (wf_rac_enabled_) {
+              // 33B WF-RAC extra command bytes
+              MISO_frame[DB16] = new_VanesLR1; new_VanesLR1 = 0;
+              MISO_frame[DB17] = new_VanesLR0 | new_3Dauto;
+              new_VanesLR0 = 0;
+              new_3Dauto = 0;
+          }
 
-    MISO_frame[DB0] |= new_Mode;
-    new_Mode = 0;
+          pending_cmd_ = false;
+      }
 
-    MISO_frame[DB2] = new_Tsetpoint;
-    new_Tsetpoint = 0;
-
-    MISO_frame[DB1] = new_Fan;
-    new_Fan = 0;
-
-    MISO_frame[DB0] |= new_Vanes0;
-    MISO_frame[DB1] |= new_Vanes1;
-    new_Vanes0 = 0;
-    new_Vanes1 = 0;
-
-    if (request_erropData) {
-      MISO_frame[DB6] = 0x80;
-      MISO_frame[DB9] = 0x45;
-      request_erropData = false;
-    }
+      // request_erropData laten staan
+      if (request_erropData) {
+        MISO_frame[DB6] = 0x80;
+        MISO_frame[DB9] = 0x45;
+        request_erropData = false;
+      }
   }
 
   MISO_frame[DB3] = new_Troom;  // from MQTT or DS18x20

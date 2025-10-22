@@ -166,6 +166,11 @@ class MHI_AC_Ctrl_Core {
 
     CallbackInterface_Status *m_cbiStatus;
 
+    bool wf_rac_enabled_ = false;   // true => gebruik 33B command frames (WF-RAC) voor schrijven
+    bool coexist_mode_   = true;    // true => M2: alleen wijzigingen pushen, IR/RC mag ook sturen
+    bool pending_cmd_    = false;   // er staat iets te versturen in volgende frame
+
+
   public:
     void MHIAcCtrlStatus(CallbackInterface_Status *cb) {
       m_cbiStatus = cb;
@@ -187,5 +192,8 @@ class MHI_AC_Ctrl_Core {
     void set_frame_size(byte framesize);  // set framesize to 20 or 33
     void set_3Dauto(AC3Dauto Dauto);      // set the requested 3D auto mode
     void set_vanesLR(uint vanesLR);       // set the vanes vertical position
+
+    void set_wf_rac_enabled(bool en) { wf_rac_enabled_ = en; }
+    void set_coexist_mode(bool en)   { coexist_mode_   = en; }
 
 };
