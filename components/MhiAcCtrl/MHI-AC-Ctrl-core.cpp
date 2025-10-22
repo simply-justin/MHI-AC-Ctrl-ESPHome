@@ -157,21 +157,23 @@ inline bool mhi_is_valid_header(const uint8_t *buf) {
 int MHI_AC_Ctrl_Core::loop(uint max_time_ms) {
   const byte opdataCnt = sizeof(opdata) / sizeof(byte) / 2;
   static byte opdataNo = 0;
-  const unsigned long startMillis = millis();
-
-  byte MOSI_byte = 0;
+  long startMillis = millis();
+  byte MOSI_byte;
   bool new_datapacket_received = false;
   static byte erropdataCnt = 0;
   static bool doubleframe = false;
   static int frame = 1;
 
+  // --- Smoothing (Option C) for room temperature (DB3) ---
+  // DB3 is raw 0.25°C steps => 0.5°C == 2 counts
+  static uint8_t last_reported_troom = 0xFF;
+  static uint32_t last_report_ms = 0;
+  const uint8_t TROOM_DELTA_RAW = 2;       // 0.5°C
+  const uint32_t TROOM_STABLE_MS = 5000;   // 5s
+
   static byte MOSI_frame[33];
-  static byte MISO_frame[] = {
-    0xA9, 0x00, 0x07, 0x00, 0x00, 0x00, 0xff, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0x0f, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff,
-    0xff, 0xff, 0x22
-  };
+  //                            sb0   sb1   sb2   db0   db1   db2   db3   db4   db5   db6   db7   db8   db9  db10  db11  db12  db13  db14  chkH  chkL  db15  db16  db17  db18  db19  db20  db21  db22  db23  db24  db25  db26  chk2L
+  static byte MISO_frame[] = { 0xA9, 0x00, 0x07, 0x00, 0x00, 0x00, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0x0f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0x22 };
 
   static uint call_counter = 0;
   static unsigned long lastTroomInternalMillis = 0;
@@ -179,21 +181,18 @@ int MHI_AC_Ctrl_Core::loop(uint max_time_ms) {
   if (frameSize == 33) MISO_frame[0] = 0xAA;
 
   call_counter++;
-
-  // Wacht op stabiele SCK-high om frame start te detecteren
-  unsigned long sckHighStart = millis();
-  while (millis() - sckHighStart < 5) {
-    if (!digitalRead(SCK_PIN)) sckHighStart = millis();
+  int SCKMillis = millis();
+  while (millis() - SCKMillis < 5) {       // wait 5ms stable high before frame start
+    if (!digitalRead(SCK_PIN)) SCKMillis = millis();
     if (millis() - startMillis > max_time_ms) return err_msg_timeout_SCK_low;
   }
 
-  // Volgende MISO frame opbouwen
+  // Build next MISO frame
   doubleframe = !doubleframe;
   MISO_frame[DB14] = doubleframe << 2;
 
-  // OpData cyclus spreiden
+  // OpData request pacing across 20s cycle
   if ((frame > (NoFramesPerOpDataCycle / opdataCnt)) && doubleframe) frame = 1;
-
   if (frame++ <= 2) {
     if (doubleframe) {
       if (erropdataCnt == 0) {
@@ -208,25 +207,30 @@ int MHI_AC_Ctrl_Core::loop(uint max_time_ms) {
   }
 
   if (doubleframe) {
-    // default leegmaken
+    // Clear command fields each doubleframe; we’ll only write if pending_cmd_ == true
     MISO_frame[DB0] = 0x00;
     MISO_frame[DB1] = 0x00;
     MISO_frame[DB2] = 0x00;
 
-    // Commands meesturen (legacy + 33B velden)
-    MISO_frame[DB0] |= new_Power;     new_Power = 0;
-    MISO_frame[DB0] |= new_Mode;      new_Mode = 0;
-    MISO_frame[DB2]  = new_Tsetpoint; new_Tsetpoint = 0;
-    MISO_frame[DB1] |= new_Fan;       new_Fan = 0;
-    MISO_frame[DB0] |= new_Vanes0;    new_Vanes0 = 0;
-    MISO_frame[DB1] |= new_Vanes1;    new_Vanes1 = 0;
+    // --- Coexist Mode 1: only transmit when ESPHome has a pending command ---
+    if (pending_cmd_) {
+      // Legacy command bytes (always needed)
+      MISO_frame[DB0] |= new_Power;      new_Power = 0;
+      MISO_frame[DB0] |= new_Mode;       new_Mode = 0;
+      MISO_frame[DB2]  = new_Tsetpoint;  new_Tsetpoint = 0;
+      MISO_frame[DB1] |= new_Fan;        new_Fan = 0;
+      MISO_frame[DB0] |= new_Vanes0;     new_Vanes0 = 0;
+      MISO_frame[DB1] |= new_Vanes1;     new_Vanes1 = 0;
 
-    if (frameSize == 33) {
-      // Extra command bytes voor WF-RAC
-      MISO_frame[DB16] = new_VanesLR1; new_VanesLR1 = 0;
-      MISO_frame[DB17] = (new_VanesLR0 | new_3Dauto);
-      new_VanesLR0 = 0;
-      new_3Dauto   = 0;
+      if (wf_rac_enabled_) {
+        // 33B extras
+        MISO_frame[DB16] = new_VanesLR1; new_VanesLR1 = 0;
+        MISO_frame[DB17] = new_VanesLR0 | new_3Dauto;
+        new_VanesLR0 = 0;
+        new_3Dauto   = 0;
+      }
+
+      pending_cmd_ = false;
     }
 
     if (erropdataCnt > 0) {
@@ -242,32 +246,28 @@ int MHI_AC_Ctrl_Core::loop(uint max_time_ms) {
     }
   }
 
-  // Externe/ interne kamertemperatuur byte
+  // External / internal room temperature selection
   MISO_frame[DB3] = new_Troom;
 
-  // Checksums op OUT (MISO) correct zetten
-  uint16_t chks = calc_checksum(MISO_frame);
-  MISO_frame[CBH] = highByte(chks);
-  MISO_frame[CBL] = lowByte(chks);
-
+  uint16_t checksum = calc_checksum(MISO_frame);
+  MISO_frame[CBH] = highByte(checksum);
+  MISO_frame[CBL] = lowByte(checksum);
   if (frameSize == 33) {
-    chks = calc_checksumFrame33(MISO_frame);
-    MISO_frame[CBL2] = lowByte(chks);
+    checksum = calc_checksumFrame33(MISO_frame);
+    MISO_frame[CBL2] = lowByte(checksum);
   }
 
-  // Bit-bang transfer van frameSize bytes
+  // Bitbang read/write one full frame
   for (uint8_t byte_cnt = 0; byte_cnt < frameSize; byte_cnt++) {
     MOSI_byte = 0;
     byte bit_mask = 1;
     for (uint8_t bit_cnt = 0; bit_cnt < 8; bit_cnt++) {
-      unsigned long sckWait = millis();
+      SCKMillis = millis();
       while (digitalRead(SCK_PIN)) {
         if (millis() - startMillis > max_time_ms) return err_msg_timeout_SCK_high;
       }
       digitalWrite(MISO_PIN, (MISO_frame[byte_cnt] & bit_mask) ? 1 : 0);
-      while (!digitalRead(SCK_PIN)) {
-        if (millis() - sckWait > max_time_ms) return err_msg_timeout_SCK_high;
-      }
+      while (!digitalRead(SCK_PIN)) {}
       if (digitalRead(MOSI_PIN)) MOSI_byte += bit_mask;
       bit_mask <<= 1;
     }
@@ -277,121 +277,361 @@ int MHI_AC_Ctrl_Core::loop(uint max_time_ms) {
     }
   }
 
-  // **Geen** harde fouten meer op MOSI signature/checksum – alleen loggen
-  bool header_ok = ((MOSI_frame[SB0] & 0xfe) == 0x6c) && (MOSI_frame[SB1] == 0x80) && (MOSI_frame[SB2] == 0x04);
-  if (!header_ok) {
-    ESP_LOGW(MHI_RAW_TAG, "Header mismatch (MOSI): %02X %02X %02X", MOSI_frame[SB0], MOSI_frame[SB1], MOSI_frame[SB2]);
-  } else {
-    // (optioneel): checksum berekenen voor debug
-    uint16_t cs_mosi = calc_checksum(MOSI_frame);
-    uint16_t cs_mosi_frame = (MOSI_frame[CBH] << 8) | MOSI_frame[CBL];
-    if (cs_mosi != cs_mosi_frame) {
-      ESP_LOGW(MHI_RAW_TAG, "Checksum mismatch (MOSI): got=%04X calc=%04X", cs_mosi_frame, cs_mosi);
-    }
+  // Quick header check (fast reject)
+  if (((MOSI_frame[SB0] & 0xfe) != 0x6c) || (MOSI_frame[SB1] != 0x80) || (MOSI_frame[SB2] != 0x04)) {
+    return err_msg_invalid_signature;
   }
 
+  // If we saw any change, process the new frame
   if (new_datapacket_received) {
-    // RAW dump voor analyse
     mhi_log_raw(MOSI_frame, frameSize);
 
-    // ====== Spam-friendly publish: ALTIJD uitsturen, niet alleen bij verandering ======
+    // Strict header validation
+    if (!mhi_is_valid_header(MOSI_frame)) {
+      memset(MOSI_frame, 0, frameSize);
+      return err_msg_invalid_signature;
+    }
 
-    // 33B extra status
+    // Strict checksum validation (report -2 upward; platform decides logging)
+    uint16_t cs = calc_checksum(MOSI_frame);
+    uint16_t cs_frame = (MOSI_frame[CBH] << 8) | MOSI_frame[CBL];
+    if (cs != cs_frame) {
+      return err_msg_invalid_checksum;
+    }
+    if (frameSize == 33) {
+      uint16_t cs33 = calc_checksumFrame33(MOSI_frame);
+      if (MOSI_frame[CBL2] != lowByte(cs33)) {
+        return err_msg_invalid_checksum;
+      }
+    }
+
+    // 33B readouts (LR vanes / 3D auto)
     if (frameSize == 33) {
       byte vanesLRtmp = (MOSI_frame[DB16] & 0x07) + ((MOSI_frame[DB17] & 0x01) << 4);
-      m_cbiStatus->cbiStatusFunction(status_vanesLR, (vanesLRtmp & 0x10) ? vanesLR_swing : ((vanesLRtmp & 0x07) + 1));
-      m_cbiStatus->cbiStatusFunction(status_3Dauto, MOSI_frame[DB17] & 0x04);
+      if (vanesLRtmp != status_vanesLR_old) {
+        if ((vanesLRtmp & 0x10) != 0) m_cbiStatus->cbiStatusFunction(status_vanesLR, vanesLR_swing);
+        else                          m_cbiStatus->cbiStatusFunction(status_vanesLR, (vanesLRtmp & 0x07) + 1);
+        status_vanesLR_old = vanesLRtmp;
+      }
+      if ((MOSI_frame[DB17] & 0x04) != status_3Dauto_old) {
+        status_3Dauto_old = MOSI_frame[DB17] & 0x04;
+        m_cbiStatus->cbiStatusFunction(status_3Dauto, status_3Dauto_old);
+      }
     }
 
-    // Mode/Power/Fan/Vanes/Troom/Tsetpoint/Error altijd pushen
-    m_cbiStatus->cbiStatusFunction(status_mode,      MOSI_frame[DB0] & 0x1c);
-    m_cbiStatus->cbiStatusFunction(status_power,     MOSI_frame[DB0] & 0x01);
-    m_cbiStatus->cbiStatusFunction(status_fan,       MOSI_frame[DB1] & 0x07);
+    // Mode
+    if ((MOSI_frame[DB0] & 0x1c) != status_mode_old) {
+      status_mode_old = MOSI_frame[DB0] & 0x1c;
+      m_cbiStatus->cbiStatusFunction(status_mode, status_mode_old);
+    }
 
+    // Power
+    if ((MOSI_frame[DB0] & 0x01) != status_power_old) {
+      status_power_old = MOSI_frame[DB0] & 0x01;
+      m_cbiStatus->cbiStatusFunction(status_power, status_power_old);
+    }
+
+    // Fan
+    uint fantmp = MOSI_frame[DB1] & 0x07;
+    if (fantmp != status_fan_old) {
+      status_fan_old = fantmp;
+      m_cbiStatus->cbiStatusFunction(status_fan, status_fan_old);
+    }
+
+    // Vanes (UD)
     uint vanestmp = (MOSI_frame[DB0] & 0xc0) + ((MOSI_frame[DB1] & 0xB0) >> 4);
-    m_cbiStatus->cbiStatusFunction(status_vanes, (vanestmp & 0x40) ? vanes_swing : ((vanestmp & 0x03) + 1));
-
-    // Troom met anti-jitter zoals origineel
-    if (MISO_frame[DB3] != 0xff) {
-      m_cbiStatus->cbiStatusFunction(status_troom, MOSI_frame[DB3]);
-      lastTroomInternalMillis = 0;
-    } else if ((unsigned long)(millis() - lastTroomInternalMillis) > minTimeInternalTroom) {
-      lastTroomInternalMillis = millis();
-      m_cbiStatus->cbiStatusFunction(status_troom, MOSI_frame[DB3]);
+    if (vanestmp != status_vanes_old) {
+      if ((vanestmp & 0x40) != 0) m_cbiStatus->cbiStatusFunction(status_vanes, vanes_swing);
+      else                        m_cbiStatus->cbiStatusFunction(status_vanes, (vanestmp & 0x03) + 1);
+      status_vanes_old = vanestmp;
     }
 
-    m_cbiStatus->cbiStatusFunction(status_tsetpoint,  MOSI_frame[DB2]);
-    m_cbiStatus->cbiStatusFunction(status_errorcode,  MOSI_frame[DB4]);
+    // --- Room temperature with smoothing (Option C) ---
+    if (MOSI_frame[DB3] != status_troom_old) {
+      const uint8_t raw = MOSI_frame[DB3];
+      const uint32_t now = millis();
 
-    // OpData – altijd pushen (niet alleen bij verandering)
-    const bool mosi_is_op = ((MOSI_frame[DB10] & 0x30) == 0x10);
+      // If we’re not using the internal sensor (DB3 set via external), publish immediately
+      if (MISO_frame[DB3] != 0xff) {
+        status_troom_old = raw;
+        m_cbiStatus->cbiStatusFunction(status_troom, status_troom_old);
+        lastTroomInternalMillis = 0;
+        // also keep smoother in sync
+        last_reported_troom = raw;
+        last_report_ms = now;
+      } else {
+        // Internal sensor → smooth: publish if ≥0.5°C delta OR ≥5s passed
+        bool big_delta = (last_reported_troom == 0xFF) || ( (raw > last_reported_troom) ? (raw - last_reported_troom) : (last_reported_troom - raw) ) >= TROOM_DELTA_RAW;
+        bool time_ok   = (now - last_report_ms) >= TROOM_STABLE_MS;
+
+        if (big_delta || time_ok) {
+          last_report_ms = now;
+          last_reported_troom = raw;
+          status_troom_old = raw;
+          m_cbiStatus->cbiStatusFunction(status_troom, status_troom_old);
+        }
+      }
+    }
+
+    // Setpoint
+    if (MOSI_frame[DB2] != status_tsetpoint_old) {
+      status_tsetpoint_old = MOSI_frame[DB2];
+      m_cbiStatus->cbiStatusFunction(status_tsetpoint, status_tsetpoint_old);
+    }
+
+    // Error code
+    if (MOSI_frame[DB4] != status_errorcode_old) {
+      status_errorcode_old = MOSI_frame[DB4];
+      m_cbiStatus->cbiStatusFunction(status_errorcode, status_errorcode_old);
+    }
+
+    // --- Operating / Error Operating Data ---
+    bool MOSI_type_opdata = (MOSI_frame[DB10] & 0x30) == 0x10;
+
     switch (MOSI_frame[DB9]) {
-      case 0x94: if ((MOSI_frame[DB6] & 0x80) != 0 && mosi_is_op)
-                    m_cbiStatus->cbiStatusFunction(opdata_kwh, (MOSI_frame[DB12] << 8) + MOSI_frame[DB11]); break;
-      case 0x02: m_cbiStatus->cbiStatusFunction(mosi_is_op ? opdata_mode : erropdata_mode, (MOSI_frame[DB10] & 0x0f) << 2); break;
+      case 0x94: if ((MOSI_frame[DB6] & 0x80) != 0) {
+        if (MOSI_type_opdata) {
+          if (((MOSI_frame[DB12] << 8) + (MOSI_frame[DB11])) != op_kwh_old) {
+            op_kwh_old = (MOSI_frame[DB12] << 8) + (MOSI_frame[DB11]);
+            m_cbiStatus->cbiStatusFunction(opdata_kwh, op_kwh_old);
+          }
+        }
+      } break;
+
+      case 0x02: if ((MOSI_frame[DB6] & 0x80) != 0) {
+        if (MOSI_type_opdata) {
+          if (MOSI_frame[DB10] != op_mode_old) {
+            op_mode_old = MOSI_frame[DB10];
+            m_cbiStatus->cbiStatusFunction(opdata_mode, (op_mode_old & 0x0f) << 2);
+          }
+        } else {
+          m_cbiStatus->cbiStatusFunction(erropdata_mode, (MOSI_frame[DB10] & 0x0f) << 2);
+        }
+      } break;
+
       case 0x05: if ((MOSI_frame[DB6] & 0x80) != 0) {
-                    if (MOSI_frame[DB10] == 0x13) m_cbiStatus->cbiStatusFunction(opdata_tsetpoint, MOSI_frame[DB11]);
-                    else if (MOSI_frame[DB10] == 0x33) m_cbiStatus->cbiStatusFunction(erropdata_tsetpoint, MOSI_frame[DB11]);
-                 } break;
-      case 0x81: if ((MOSI_frame[DB6] & 0x80) != 0) {
-                    if ((MOSI_frame[DB10] & 0x30) == 0x20) m_cbiStatus->cbiStatusFunction(opdata_thi_r1, MOSI_frame[DB11]);
-                    else m_cbiStatus->cbiStatusFunction(erropdata_thi_r1, MOSI_frame[DB11]);
-                 } else {
-                    if (mosi_is_op) m_cbiStatus->cbiStatusFunction(opdata_thi_r2, MOSI_frame[DB11]);
-                    else m_cbiStatus->cbiStatusFunction(erropdata_thi_r2, MOSI_frame[DB11]);
-                 } break;
-      case 0x87: if ((MOSI_frame[DB6] & 0x80) != 0)
-                    (mosi_is_op ? m_cbiStatus->cbiStatusFunction(opdata_thi_r3, MOSI_frame[DB11])
-                                : m_cbiStatus->cbiStatusFunction(erropdata_thi_r3, MOSI_frame[DB11])); break;
-      case 0x80: if ((MOSI_frame[DB6] & 0x80) != 0) {
-                    if ((MOSI_frame[DB10] & 0x30) == 0x20) m_cbiStatus->cbiStatusFunction(opdata_return_air, MOSI_frame[DB11]);
-                    else m_cbiStatus->cbiStatusFunction(erropdata_return_air, MOSI_frame[DB11]);
-                 } else {
-                    if (mosi_is_op) m_cbiStatus->cbiStatusFunction(opdata_outdoor, MOSI_frame[DB11]);
-                    else m_cbiStatus->cbiStatusFunction(erropdata_outdoor, MOSI_frame[DB11]);
-                 } break;
-      case 0x1f: if ((MOSI_frame[DB6] & 0x80) != 0)
-                    (mosi_is_op ? m_cbiStatus->cbiStatusFunction(opdata_iu_fanspeed, MOSI_frame[DB10] & 0x0f)
-                                : m_cbiStatus->cbiStatusFunction(erropdata_iu_fanspeed, MOSI_frame[DB10] & 0x0f));
-                 else
-                    (mosi_is_op ? m_cbiStatus->cbiStatusFunction(opdata_ou_fanspeed, MOSI_frame[DB10] & 0x0f)
-                                : m_cbiStatus->cbiStatusFunction(erropdata_ou_fanspeed, MOSI_frame[DB10] & 0x0f)); break;
-      case 0x1e: if ((MOSI_frame[DB6] & 0x80) != 0)
-                    (mosi_is_op ? m_cbiStatus->cbiStatusFunction(opdata_total_iu_run, MOSI_frame[DB11])
-                                : m_cbiStatus->cbiStatusFunction(erropdata_total_iu_run, MOSI_frame[DB11]));
-                 else {
-                    if (MOSI_frame[DB10] == 0x11) m_cbiStatus->cbiStatusFunction(opdata_total_comp_run, MOSI_frame[DB11]);
-                    else m_cbiStatus->cbiStatusFunction(erropdata_total_comp_run, MOSI_frame[DB11]);
-                 } break;
-      case 0x82: if ((MOSI_frame[DB6] & 0x80) == 0)
-                    (mosi_is_op ? m_cbiStatus->cbiStatusFunction(opdata_tho_r1, MOSI_frame[DB11])
-                                : m_cbiStatus->cbiStatusFunction(erropdata_tho_r1, MOSI_frame[DB11])); break;
-      case 0x11: if ((MOSI_frame[DB6] & 0x80) == 0)
-                    (mosi_is_op ? m_cbiStatus->cbiStatusFunction(opdata_comp, ((MOSI_frame[DB10] << 8) | MOSI_frame[DB11]) & 0x0fff)
-                                : m_cbiStatus->cbiStatusFunction(erropdata_comp, ((MOSI_frame[DB10] << 8) | MOSI_frame[DB11]) & 0x0fff)); break;
-      case 0x85: if ((MOSI_frame[DB6] & 0x80) == 0)
-                    (mosi_is_op ? m_cbiStatus->cbiStatusFunction(opdata_td, MOSI_frame[DB11])
-                                : m_cbiStatus->cbiStatusFunction(erropdata_td, MOSI_frame[DB11])); break;
-      case 0x90: if ((MOSI_frame[DB6] & 0x80) == 0)
-                    (mosi_is_op ? m_cbiStatus->cbiStatusFunction(opdata_ct, MOSI_frame[DB11])
-                                : m_cbiStatus->cbiStatusFunction(erropdata_ct, MOSI_frame[DB11])); break;
-      case 0xb1: if ((MOSI_frame[DB6] & 0x80) == 0 && mosi_is_op)
-                    m_cbiStatus->cbiStatusFunction(opdata_tdsh, MOSI_frame[DB11] / 2); break;
-      case 0x7c: if ((MOSI_frame[DB6] & 0x80) == 0 && mosi_is_op)
-                    m_cbiStatus->cbiStatusFunction(opdata_protection_no, MOSI_frame[DB11]); break;
-      case 0x0c: if ((MOSI_frame[DB6] & 0x80) == 0 && mosi_is_op)
-                    m_cbiStatus->cbiStatusFunction(opdata_defrost, MOSI_frame[DB10] & 0x01); break;
-      case 0x13: if ((MOSI_frame[DB6] & 0x80) == 0)
-                    (mosi_is_op ? m_cbiStatus->cbiStatusFunction(opdata_ou_eev1, (MOSI_frame[DB12] << 8) | MOSI_frame[DB11])
-                                : m_cbiStatus->cbiStatusFunction(erropdata_ou_eev1, (MOSI_frame[DB12] << 8) | MOSI_frame[DB11])); break;
-      case 0x45:
+        if (MOSI_frame[DB10] == 0x13) {
+          if (MOSI_frame[DB11] != op_settemp_old) {
+            op_settemp_old = MOSI_frame[DB11];
+            m_cbiStatus->cbiStatusFunction(opdata_tsetpoint, op_settemp_old);
+          }
+        } else if (MOSI_frame[DB10] == 0x33) {
+          m_cbiStatus->cbiStatusFunction(erropdata_tsetpoint, MOSI_frame[DB11]);
+        }
+      } break;
+
+      case 0x81:
         if ((MOSI_frame[DB6] & 0x80) != 0) {
-          if (MOSI_frame[DB10] == 0x11) m_cbiStatus->cbiStatusFunction(erropdata_errorcode, MOSI_frame[DB11]);
-          else if (MOSI_frame[DB10] == 0x12) erropdataCnt = MOSI_frame[DB11] + 4;
+          if ((MOSI_frame[DB10] & 0x30) == 0x20) {
+            if (MOSI_frame[DB11] != op_thi_r1_old) {
+              op_thi_r1_old = MOSI_frame[DB11];
+              m_cbiStatus->cbiStatusFunction(opdata_thi_r1, op_thi_r1_old);
+            }
+          } else {
+            m_cbiStatus->cbiStatusFunction(erropdata_thi_r1, MOSI_frame[DB11]);
+          }
+        } else {
+          if (MOSI_type_opdata) {
+            if (MOSI_frame[DB11] != op_thi_r2_old) {
+              op_thi_r2_old = MOSI_frame[DB11];
+              m_cbiStatus->cbiStatusFunction(opdata_thi_r2, op_thi_r2_old);
+            }
+          } else {
+            m_cbiStatus->cbiStatusFunction(erropdata_thi_r2, MOSI_frame[DB11]);
+          }
         }
         break;
+
+      case 0x87:
+        if ((MOSI_frame[DB6] & 0x80) != 0) {
+          if (MOSI_type_opdata) {
+            if (MOSI_frame[DB11] != op_thi_r3_old) {
+              op_thi_r3_old = MOSI_frame[DB11];
+              m_cbiStatus->cbiStatusFunction(opdata_thi_r3, op_thi_r3_old);
+            }
+          } else {
+            m_cbiStatus->cbiStatusFunction(erropdata_thi_r3, MOSI_frame[DB11]);
+          }
+        }
+        break;
+
+      case 0x80:
+        if ((MOSI_frame[DB6] & 0x80) != 0) {
+          if ((MOSI_frame[DB10] & 0x30) == 0x20) {
+            if (MOSI_frame[DB11] != op_return_air_old) {
+              op_return_air_old = MOSI_frame[DB11];
+              m_cbiStatus->cbiStatusFunction(opdata_return_air, op_return_air_old);
+            }
+          } else {
+            m_cbiStatus->cbiStatusFunction(erropdata_return_air, MOSI_frame[DB11]);
+          }
+        } else {
+          if (MOSI_type_opdata) {
+            if (MOSI_frame[DB11] != op_outdoor_old) {
+              op_outdoor_old = MOSI_frame[DB11];
+              m_cbiStatus->cbiStatusFunction(opdata_outdoor, op_outdoor_old);
+            }
+          } else {
+            m_cbiStatus->cbiStatusFunction(erropdata_outdoor, MOSI_frame[DB11]);
+          }
+        }
+        break;
+
+      case 0x1f:
+        if ((MOSI_frame[DB6] & 0x80) != 0) {
+          if (MOSI_type_opdata) {
+            if (MOSI_frame[DB10] != op_iu_fanspeed_old) {
+              op_iu_fanspeed_old = MOSI_frame[DB10];
+              m_cbiStatus->cbiStatusFunction(opdata_iu_fanspeed, op_iu_fanspeed_old & 0x0f);
+            }
+          } else {
+            m_cbiStatus->cbiStatusFunction(erropdata_iu_fanspeed, MOSI_frame[DB10] & 0x0f);
+          }
+        } else {
+          if (MOSI_type_opdata) {
+            if (MOSI_frame[DB10] != op_ou_fanspeed_old) {
+              op_ou_fanspeed_old = MOSI_frame[DB10];
+              m_cbiStatus->cbiStatusFunction(opdata_ou_fanspeed, op_ou_fanspeed_old & 0x0f);
+            }
+          } else {
+            m_cbiStatus->cbiStatusFunction(erropdata_ou_fanspeed, MOSI_frame[DB10] & 0x0f);
+          }
+        }
+        break;
+
+      case 0x1e:
+        if ((MOSI_frame[DB6] & 0x80) != 0) {
+          if (MOSI_type_opdata) {
+            if (MOSI_frame[DB11] != op_total_iu_run_old) {
+              op_total_iu_run_old = MOSI_frame[DB11];
+              m_cbiStatus->cbiStatusFunction(opdata_total_iu_run, op_total_iu_run_old);
+            }
+          } else {
+            m_cbiStatus->cbiStatusFunction(erropdata_total_iu_run, MOSI_frame[DB11]);
+          }
+        } else {
+          if (MOSI_frame[DB10] == 0x11) {
+            if (MOSI_frame[DB11] != op_total_comp_run_old) {
+              op_total_comp_run_old = MOSI_frame[DB11];
+              m_cbiStatus->cbiStatusFunction(opdata_total_comp_run, op_total_comp_run_old);
+            }
+          } else {
+            m_cbiStatus->cbiStatusFunction(erropdata_total_comp_run, MOSI_frame[DB11]);
+          }
+        }
+        break;
+
+      case 0x82:
+        if ((MOSI_frame[DB6] & 0x80) == 0) {
+          if (MOSI_type_opdata) {
+            if (MOSI_frame[DB11] != op_tho_r1_old) {
+              op_tho_r1_old = MOSI_frame[DB11];
+              m_cbiStatus->cbiStatusFunction(opdata_tho_r1, op_tho_r1_old);
+            }
+          } else {
+            m_cbiStatus->cbiStatusFunction(erropdata_tho_r1, MOSI_frame[DB11]);
+          }
+        }
+        break;
+
+      case 0x11:
+        if ((MOSI_frame[DB6] & 0x80) == 0) {
+          if (MOSI_type_opdata) {
+            if ((MOSI_frame[DB10] << 8 | MOSI_frame[DB11]) != op_comp_old) {
+              op_comp_old = MOSI_frame[DB10] << 8 | MOSI_frame[DB11];
+              m_cbiStatus->cbiStatusFunction(opdata_comp, op_comp_old & 0x0fff);
+            }
+          } else {
+            m_cbiStatus->cbiStatusFunction(erropdata_comp, (MOSI_frame[DB10] << 8 | MOSI_frame[DB11]) & 0x0fff);
+          }
+        }
+        break;
+
+      case 0x85:
+        if ((MOSI_frame[DB6] & 0x80) == 0) {
+          if (MOSI_type_opdata) {
+            if (MOSI_frame[DB11] != op_td_old) {
+              op_td_old = MOSI_frame[DB11];
+              m_cbiStatus->cbiStatusFunction(opdata_td, op_td_old);
+            }
+          } else {
+            m_cbiStatus->cbiStatusFunction(erropdata_td, MOSI_frame[DB11]);
+          }
+        }
+        break;
+
+      case 0x90:
+        if ((MOSI_frame[DB6] & 0x80) == 0) {
+          if (MOSI_type_opdata) {
+            if (MOSI_frame[DB11] != op_ct_old) {
+              op_ct_old = MOSI_frame[DB11];
+              m_cbiStatus->cbiStatusFunction(opdata_ct, op_ct_old);
+            }
+          } else {
+            m_cbiStatus->cbiStatusFunction(erropdata_ct, MOSI_frame[DB11]);
+          }
+        }
+        break;
+
+      case 0xb1:
+        if ((MOSI_frame[DB6] & 0x80) == 0) {
+          if (MOSI_type_opdata) {
+            if (MOSI_frame[DB11] != op_tdsh_old) {
+              op_tdsh_old = MOSI_frame[DB11];
+              m_cbiStatus->cbiStatusFunction(opdata_tdsh, op_tdsh_old / 2);
+            }
+          }
+        }
+        break;
+
+      case 0x7c:
+        if ((MOSI_frame[DB6] & 0x80) == 0) {
+          if (MOSI_type_opdata) {
+            if (MOSI_frame[DB11] != op_protection_no_old) {
+              op_protection_no_old = MOSI_frame[DB11];
+              m_cbiStatus->cbiStatusFunction(opdata_protection_no, op_protection_no_old);
+            }
+          }
+        }
+        break;
+
+      case 0x0c:
+        if ((MOSI_frame[DB6] & 0x80) == 0) {
+          if (MOSI_type_opdata) {
+            if (MOSI_frame[DB10] != op_defrost_old) {
+              op_defrost_old = MOSI_frame[DB10];
+              m_cbiStatus->cbiStatusFunction(opdata_defrost, op_defrost_old & 0b1);
+            }
+          }
+        }
+        break;
+
+      case 0x13:
+        if ((MOSI_frame[DB6] & 0x80) == 0) {
+          if (MOSI_type_opdata) {
+            if ((MOSI_frame[DB12] << 8 | MOSI_frame[DB11]) != op_ou_eev1_old) {
+              op_ou_eev1_old = MOSI_frame[DB12] << 8 | MOSI_frame[DB11];
+              m_cbiStatus->cbiStatusFunction(opdata_ou_eev1, op_ou_eev1_old);
+            }
+          } else {
+            m_cbiStatus->cbiStatusFunction(erropdata_ou_eev1, MOSI_frame[DB12] << 8 | MOSI_frame[DB11]);
+          }
+        }
+        break;
+
+      case 0x45:
+        if ((MOSI_frame[DB6] & 0x80) != 0) {
+          if (MOSI_frame[DB10] == 0x11) {
+            m_cbiStatus->cbiStatusFunction(erropdata_errorcode, MOSI_frame[DB11]);
+          } else if (MOSI_frame[DB10] == 0x12) {
+            erropdataCnt = MOSI_frame[DB11] + 4;
+          }
+        }
+        break;
+
       default:
-        m_cbiStatus->cbiStatusFunction(opdata_unknown, (MOSI_frame[DB10] << 8) | MOSI_frame[DB9]);
+        // Unknown but report so higher layers can inspect
+        m_cbiStatus->cbiStatusFunction(opdata_unknown, MOSI_frame[DB10] << 8 | MOSI_frame[DB9]);
         break;
     }
   }
