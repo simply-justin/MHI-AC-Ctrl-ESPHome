@@ -156,126 +156,6 @@ inline bool mhi_is_valid_header(const uint8_t *buf) {
 
 int MHI_AC_Ctrl_Core::loop(uint max_time_ms) {
   const byte opdataCnt = sizeof(opdata) / sizeof(byte) / 2;
-  static byte opdataNo = 0;
-  long startMillis = millis();
-  byte MOSI_byte;
-  bool new_datapacket_received = false;
-  static byte erropdataCnt = 0;
-  static bool doubleframe = false;
-  static int frame = 1;
-  static byte MOSI_frame[33];
-  static byte MISO_frame[33] = {
-    0xAA,0x00,0x07,0x00,0x00,0x00,0xff,0x00,0x00,0x00,
-    0x00,0x00,0xff,0xff,0xff,0xff,0x0f,0x00,0x00,0x00,
-    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xff,0xff,
-    0xff,0xff,0x22
-  };
-
-  static uint call_counter = 0;
-  static unsigned long lastTroomInternalMillis = 0;
-  if (frameSize == 20) MISO_frame[0] = 0xA9;
-
-  call_counter++;
-  int SCKMillis = millis();
-  while (millis() - SCKMillis < 5) {
-    if (!digitalRead(SCK_PIN)) SCKMillis = millis();
-    if (millis() - startMillis > max_time_ms) return err_msg_timeout_SCK_low;
-  }
-
-  doubleframe = !doubleframe;
-  MISO_frame[DB14] = doubleframe << 2;
-
-  if ((frame > (NoFramesPerOpDataCycle / opdataCnt)) && doubleframe) frame = 1;
-  if (frame++ <= 2 && doubleframe && erropdataCnt == 0) {
-    MISO_frame[DB6] = pgm_read_word(opdata + opdataNo);
-    MISO_frame[DB9] = pgm_read_word(opdata + opdataNo) >> 8;
-    opdataNo = (opdataNo + 1) % opdataCnt;
-  } else {
-    MISO_frame[DB6] = 0x80;
-    MISO_frame[DB9] = 0xff;
-  }
-
-  if (doubleframe) {
-    MISO_frame[DB0] = 0x00;
-    MISO_frame[DB1] = 0x00;
-    MISO_frame[DB2] = 0x00;
-
-    if (!coexist_mode_ || pending_cmd_) {
-      MISO_frame[DB0] |= new_Power;     new_Power = 0;
-      MISO_frame[DB0] |= new_Mode;      new_Mode = 0;
-      MISO_frame[DB2]  = new_Tsetpoint; new_Tsetpoint = 0;
-      MISO_frame[DB1] |= new_Fan;       new_Fan = 0;
-      MISO_frame[DB0] |= new_Vanes0;    new_Vanes0 = 0;
-      MISO_frame[DB1] |= new_Vanes1;    new_Vanes1 = 0;
-
-      if (wf_rac_enabled_) {
-        MISO_frame[DB16] = new_VanesLR1; new_VanesLR1 = 0;
-        MISO_frame[DB17] = new_VanesLR0 | new_3Dauto;
-        new_VanesLR0 = 0;
-        new_3Dauto = 0;
-      }
-      pending_cmd_ = false;
-    }
-
-    if (request_erropData) {
-      MISO_frame[DB6] = 0x80;
-      MISO_frame[DB9] = 0x45;
-      request_erropData = false;
-    }
-  }
-
-  MISO_frame[DB3] = new_Troom;
-
-  uint16_t checksum = calc_checksum(MISO_frame);
-  MISO_frame[CBH] = highByte(checksum);
-  MISO_frame[CBL] = lowByte(checksum);
-
-  if (frameSize == 33) {
-    checksum = calc_checksumFrame33(MISO_frame);
-    MISO_frame[CBL2] = lowByte(checksum);
-  }
-
-  for (uint8_t byte_cnt = 0; byte_cnt < frameSize; byte_cnt++) {
-    MOSI_byte = 0;
-    byte bit_mask = 1;
-    for (uint8_t bit_cnt = 0; bit_cnt < 8; bit_cnt++) {
-      SCKMillis = millis();
-      while (digitalRead(SCK_PIN)) {
-        if (millis() - startMillis > max_time_ms) return err_msg_timeout_SCK_high;
-      }
-      digitalWrite(MISO_PIN, (MISO_frame[byte_cnt] & bit_mask) != 0);
-      while (!digitalRead(SCK_PIN)) {}
-      if (digitalRead(MOSI_PIN)) MOSI_byte |= bit_mask;
-      bit_mask <<= 1;
-    }
-    if (MOSI_frame[byte_cnt] != MOSI_byte) {
-      new_datapacket_received = true;
-      MOSI_frame[byte_cnt] = MOSI_byte;
-    }
-  }
-
-  if (((MOSI_frame[SB0] & 0xfe) != 0x6c) || MOSI_frame[SB1] != 0x80 || MOSI_frame[SB2] != 0x04) return err_msg_invalid_signature;
-  if (((MOSI_frame[CBH] << 8) | MOSI_frame[CBL]) != calc_checksum(MOSI_frame)) return err_msg_invalid_checksum;
-  if (frameSize == 33 && MOSI_frame[CBL2] != lowByte(calc_checksumFrame33(MOSI_frame))) return err_msg_invalid_checksum;
-
-  if (new_datapacket_received) {
-    mhi_log_raw(MOSI_frame, frameSize);
-    // --- JE OUDE STATUS PARSER BLIJFT HIER ONGEWIJZIGD ---
-    // ik knip hem hier weg om het bericht niet te lang te maken
-    // maar je laat hier gewoon ALLES staan vanaf:
-    //
-    //   if (frameSize == 33) { ... }
-    //   // evaluate status
-    //   if ((MOSI_frame[DB0] & 0x1c) ...
-    //
-    // t/m het eind van de functie
-  }
-
-  return call_counter;
-}
-
-int MHI_AC_Ctrl_Core::loop(uint max_time_ms) {
-  const byte opdataCnt = sizeof(opdata) / sizeof(byte) / 2;
   static byte opdataNo = 0;               //
   long startMillis = millis();             // start time of this loop run
   byte MOSI_byte;                         // received MOSI byte
@@ -414,14 +294,6 @@ static byte MOSI_frame[33];
   checksum = calc_checksum(MOSI_frame);
   if (((MOSI_frame[SB0] & 0xfe) != 0x6c) | (MOSI_frame[SB1] != 0x80) | (MOSI_frame[SB2] != 0x04))
     return err_msg_invalid_signature;
-  // if ((MOSI_frame[CBH] << 8 | MOSI_frame[CBL]) != checksum)
-  //   return err_msg_invalid_checksum;
-
-  // if (frameSize == 33) { // Only for framesize 33 (WF-RAC)
-  //   checksum = calc_checksumFrame33(MOSI_frame);
-  //   if ( MOSI_frame[CBL2] != lowByte(checksum ) ) 
-  //     return err_msg_invalid_checksum;
-  // }
 
   if (new_datapacket_received) {
 
@@ -432,14 +304,6 @@ static byte MOSI_frame[33];
       // drop frame + resync
       memset(MOSI_frame, 0, frameSize);
       return err_msg_invalid_signature;
-    }
-
-    // 3) Checksum validation
-    uint16_t cs = calc_checksum(MOSI_frame);
-    uint16_t cs_frame = (MOSI_frame[CBH] << 8) | MOSI_frame[CBL];
-    if (cs != cs_frame) {
-      // reject + resync
-      return err_msg_invalid_checksum;
     }
 
     if (frameSize == 33) { // Only for framesize 33 (WF-RAC)
