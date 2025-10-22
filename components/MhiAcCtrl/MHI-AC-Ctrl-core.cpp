@@ -137,6 +137,11 @@ void MHI_AC_Ctrl_Core::set_frame_size(byte framesize) {
     frameSize = framesize;
 }
 
+inline bool mhi_is_valid_header(const uint8_t *buf) {
+  // MHI signature: 6D 80 04
+  return (buf[0] == 0x6D && buf[1] == 0x80 && buf[2] == 0x04);
+}
+
 int MHI_AC_Ctrl_Core::loop(uint max_time_ms) {
   const byte opdataCnt = sizeof(opdata) / sizeof(byte) / 2;
   static byte opdataNo = 0;               //
@@ -291,6 +296,21 @@ static byte MOSI_frame[33];
   if (new_datapacket_received) {
 
     mhi_log_raw(MOSI_frame, frameSize);
+
+    // 2) Header validation
+    if (!mhi_is_valid_header(MOSI_frame)) {
+      // drop frame + resync
+      memset(MOSI_frame, 0, frameSize);
+      return err_msg_invalid_signature;
+    }
+
+    // 3) Checksum validation
+    uint16_t cs = calc_checksum(MOSI_frame);
+    uint16_t cs_frame = (MOSI_frame[CBH] << 8) | MOSI_frame[CBL];
+    if (cs != cs_frame) {
+      // reject + resync
+      return err_msg_invalid_checksum;
+    }
 
     if (frameSize == 33) { // Only for framesize 33 (WF-RAC)
       byte vanesLRtmp = (MOSI_frame[DB16] & 0x07) + ((MOSI_frame[DB17] & 0x01) << 4);
